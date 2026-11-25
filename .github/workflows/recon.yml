@@ -1,0 +1,80 @@
+name: shadPS4 UWP recon
+
+# Step 1 of a shadPS4 -> Xbox Dev Mode (UWP) port.
+# This does NOT produce a port. It gathers facts: does the normal
+# desktop build work on a CI runner, which Windows APIs does shadPS4
+# import, and where do its sources touch APIs that UWP restricts.
+# Run it from the Actions tab (workflow_dispatch), then download the
+# "recon" artifact and paste report.txt back to Claude.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recon:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Clone shadPS4 (with submodules)
+        run: |
+          git clone --recursive --depth 1 https://github.com/shadps4-emu/shadPS4.git src
+          New-Item -ItemType Directory -Force recon | Out-Null
+          "shadPS4 commit: $(git -C src rev-parse HEAD)" | Out-File recon/report.txt
+          "Date: $(Get-Date -Format u)" | Out-File recon/report.txt -Append
+
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Baseline desktop build (may fail, that is useful info)
+        continue-on-error: true
+        run: |
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            -DENABLE_QT_GUI=OFF 2>&1 | Tee-Object recon/configure.log
+          cmake --build build --parallel 2>&1 | Tee-Object recon/build.log
+
+      - name: Record build result
+        run: |
+          $exe = Get-ChildItem build -Recurse -Filter shadPS4.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            "BASELINE BUILD: OK ($($exe.FullName))" | Out-File recon/report.txt -Append
+            dumpbin /imports $exe.FullName | Out-File recon/imports.txt
+            "Imports saved to imports.txt" | Out-File recon/report.txt -Append
+          } else {
+            "BASELINE BUILD: FAILED (see build.log / configure.log)" | Out-File recon/report.txt -Append
+          }
+
+      - name: Scan sources for APIs UWP restricts or lacks
+        run: |
+          $patterns = @(
+            'VirtualAlloc2','MapViewOfFile3','NtMapViewOfSection','NtAllocateVirtualMemory',
+            'VirtualProtect','VirtualAlloc','AddVectoredExceptionHandler',
+            'SetUnhandledExceptionFilter','GetThreadContext','SetThreadContext',
+            'SuspendThread','LoadLibrary','GetProcAddress','CreateProcess',
+            'CreateFile[AW]?\(','GetModuleHandle','vulkan','VK_','GLFW','SDL_','xbyak','Xbyak',
+            'ENABLE_QT_GUI','Qt'
+          )
+          $files = Get-ChildItem src/src -Recurse -Include *.cpp,*.h,*.c,*.hpp -ErrorAction SilentlyContinue
+          "`n=== API usage in src/src (pattern: files / total hits) ===" | Out-File recon/report.txt -Append
+          foreach ($p in $patterns) {
+            $hits = $files | Select-String -Pattern $p -ErrorAction SilentlyContinue
+            $nf = ($hits | Select-Object -ExpandProperty Path -Unique | Measure-Object).Count
+            $nh = ($hits | Measure-Object).Count
+            "{0,-32} {1,4} files / {2,5} hits" -f $p, $nf, $nh | Out-File recon/report.txt -Append
+            $hits | Select-Object -First 25 | ForEach-Object { "$($_.Path.Replace((Get-Location).Path,'')):$($_.LineNumber): $($_.Line.Trim())" } |
+              Out-File "recon/hits_$($p -replace '[^A-Za-z0-9]','_').txt"
+          }
+
+      - name: List third-party dependencies
+        run: |
+          "`n=== externals (submodules) ===" | Out-File recon/report.txt -Append
+          Get-ChildItem src/externals -Directory | Select-Object -ExpandProperty Name | Out-File recon/report.txt -Append
+          Get-Content src/.gitmodules | Select-String 'url' | Out-File recon/report.txt -Append
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon
+          path: recon/
